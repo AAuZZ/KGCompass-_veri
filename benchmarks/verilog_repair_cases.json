@@ -1,0 +1,459 @@
+[
+  {
+    "repo": "verilog_demo/spi_flash_ctrl",
+    "repo_identifier": "verilog_demo__spi_flash_ctrl",
+    "instance_id": "verilog_demo__spi_flash_ctrl-0001",
+    "language": "verilog",
+    "benchmark_name": "verilog-local",
+    "base_commit": "962a77bb93f9611b705eea48aeece14f848669b1",
+    "created_at": "2026-05-05T00:00:00Z",
+    "problem_statement": "SPI mode 3 transfers report an incorrect idle SCK polarity.\n\nThis SPI flash controller exposes CPOL and CPHA through the CTRL register. In mode 3, firmware expects the controller to hold SCK high while the bus is idle and to return to that level after a transfer finishes. Instead, the current shifter keeps SCK fixed low while idle because CPOL is never propagated into the shifter path.\n\nRelevant behavior crosses several files: `src/rtl/spi_flash_regs.sv` decodes CPOL/CPHA from CTRL; `src/rtl/spi_flash_ctrl_top.sv` routes those settings into the shifter; `src/rtl/spi_flash_shifter.sv` generates SCK and sample timing.\n\nExpected fix: CPOL=1 should produce idle-high SCK whenever the controller is not actively shifting.",
+    "verification": {
+      "max_attempts": 8,
+      "compile": {
+        "name": "spi_flash_compile",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/*.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": false,
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        }
+      },
+      "targeted": {
+        "name": "spi_flash_mode_err_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_mode_err_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_mode_err_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "dump_vcd": true,
+        "timeout_sec": 90,
+        "expected_outcome_by_mode": {
+          "baseline": "fail",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        }
+      },
+      "regression": [
+        {
+          "name": "spi_flash_smoke_tb",
+          "source_globs": [
+            "src/rtl/*.sv",
+            "tb/spi_flash_smoke_tb.sv"
+          ],
+          "include_dirs": [
+            "src/include"
+          ],
+          "top": "spi_flash_smoke_tb",
+          "iverilog_flags": [
+            "-g2012"
+          ],
+          "run": true,
+          "timeout_sec": 90,
+          "expected_outcome_by_mode": {
+            "baseline": "pass",
+            "candidate": "pass"
+          },
+          "markers": {
+            "pass": [
+              "PASS:"
+            ],
+            "fail": [
+              "FAIL:"
+            ]
+          }
+        }
+      ],
+      "coverage": {
+        "name": "spi_flash_cov_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_cov_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_cov_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "vvp_args": [
+          "+COVERAGE_MIN=6"
+        ],
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:",
+            "COVERAGE:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        },
+        "coverage_min_hits": 6
+      }
+    }
+  },
+  {
+    "repo": "verilog_demo/spi_flash_ctrl",
+    "repo_identifier": "verilog_demo__spi_flash_ctrl",
+    "instance_id": "verilog_demo__spi_flash_ctrl-0002",
+    "language": "verilog",
+    "benchmark_name": "verilog-local",
+    "base_commit": "962a77bb93f9611b705eea48aeece14f848669b1",
+    "created_at": "2026-05-05T00:00:00Z",
+    "problem_statement": "Burst transfers drop chip select too early when the controller still has queued TX words.\n\nFirmware programs burst mode and queues multiple TX words. The controller should keep `spi_cs_n` asserted across the burst boundary while the queued transfer is still in progress. In the current RTL, the FSM drops chip select as soon as the burst flag is armed, which truncates the sequence even though more data is pending.\n\nRelevant behavior crosses several files: `src/rtl/spi_flash_regs.sv` decodes the burst bit from CTRL; `src/rtl/spi_flash_cmd_fsm.sv` owns the chip-select state machine; `src/rtl/spi_flash_ctrl_top.sv` connects the register block, FIFO, and FSM.\n\nExpected fix: burst mode should keep chip select low across queued words until the transfer truly reaches idle.",
+    "verification": {
+      "max_attempts": 8,
+      "compile": {
+        "name": "spi_flash_compile",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/*.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": false,
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        }
+      },
+      "targeted": {
+        "name": "spi_flash_burst_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_burst_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_burst_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "expected_outcome_by_mode": {
+          "baseline": "fail",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        }
+      },
+      "regression": [
+        {
+          "name": "spi_flash_smoke_tb",
+          "source_globs": [
+            "src/rtl/*.sv",
+            "tb/spi_flash_smoke_tb.sv"
+          ],
+          "include_dirs": [
+            "src/include"
+          ],
+          "top": "spi_flash_smoke_tb",
+          "iverilog_flags": [
+            "-g2012"
+          ],
+          "run": true,
+          "timeout_sec": 90,
+          "expected_outcome_by_mode": {
+            "baseline": "pass",
+            "candidate": "pass"
+          },
+          "markers": {
+            "pass": [
+              "PASS:"
+            ],
+            "fail": [
+              "FAIL:"
+            ]
+          }
+        }
+      ],
+      "coverage": {
+        "name": "spi_flash_cov_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_cov_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_cov_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "vvp_args": [
+          "+COVERAGE_MIN=6"
+        ],
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:",
+            "COVERAGE:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        },
+        "coverage_min_hits": 6
+      }
+    }
+  },
+  {
+    "repo": "verilog_demo/spi_flash_ctrl",
+    "repo_identifier": "verilog_demo__spi_flash_ctrl",
+    "instance_id": "verilog_demo__spi_flash_ctrl-0003",
+    "language": "verilog",
+    "benchmark_name": "verilog-local",
+    "base_commit": "962a77bb93f9611b705eea48aeece14f848669b1",
+    "created_at": "2026-05-05T00:00:00Z",
+    "problem_statement": "Sticky IRQ and FIFO pending status do not stay latched across a read-clear sequence.\n\nWhen TX/RX FIFO overflow raises an interrupt, firmware expects the IRQ status and the FIFO-empty/pending status to remain visible even after the receive queue has been drained, until CONTROL[5] explicitly clears the interrupt path. The current IRQ block mirrors the live FIFO occupancy directly, so the pending view can collapse before software acknowledges it.\n\nRelevant behavior crosses several files: `src/rtl/spi_flash_fifo.sv` generates FIFO overflow and occupancy state; `src/rtl/spi_flash_irq.sv` owns sticky interrupt and latched FIFO status behavior; `src/rtl/spi_flash_regs.sv` exposes the status bits through the register map.\n\nExpected fix: the sticky IRQ and the exposed FIFO pending status should remain latched until the explicit clear operation is observed.",
+    "verification": {
+      "max_attempts": 8,
+      "compile": {
+        "name": "spi_flash_compile",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/*.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": false,
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        }
+      },
+      "targeted": {
+        "name": "spi_flash_irq_fifo_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_irq_fifo_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_irq_fifo_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "expected_outcome_by_mode": {
+          "baseline": "fail",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        }
+      },
+      "regression": [
+        {
+          "name": "spi_flash_smoke_tb",
+          "source_globs": [
+            "src/rtl/*.sv",
+            "tb/spi_flash_smoke_tb.sv"
+          ],
+          "include_dirs": [
+            "src/include"
+          ],
+          "top": "spi_flash_smoke_tb",
+          "iverilog_flags": [
+            "-g2012"
+          ],
+          "run": true,
+          "timeout_sec": 90,
+          "expected_outcome_by_mode": {
+            "baseline": "pass",
+            "candidate": "pass"
+          },
+          "markers": {
+            "pass": [
+              "PASS:"
+            ],
+            "fail": [
+              "FAIL:"
+            ]
+          }
+        }
+      ],
+      "coverage": {
+        "name": "spi_flash_cov_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/spi_flash_cov_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "spi_flash_cov_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "vvp_args": [
+          "+COVERAGE_MIN=6"
+        ],
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:",
+            "COVERAGE:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        },
+        "coverage_min_hits": 6
+      }
+    }
+  }
+  ,
+  {
+    "repo": "verilog_demo/uart_idle",
+    "repo_identifier": "verilog_demo__uart_idle",
+    "instance_id": "verilog_demo__uart_idle-0001",
+    "language": "verilog",
+    "benchmark_name": "verilog-local",
+    "base_commit": "2560c482aca1e6ddde0c1480212fd194d18bf66b",
+    "created_at": "2026-05-07T00:00:00Z",
+    "problem_statement": "The UART transmitter should drive an idle-high line when idle_high is asserted.\n\nThe current transmit path always forces tx_line low while idle, so board-level logic that samples the line between packets sees the wrong polarity.\n\nRelevant behavior crosses two files: `src/rtl/uart_tx.sv` owns the idle drive policy and `src/rtl/uart_demo_top.sv` wires the transmitter into the top level.\n\nExpected fix: when the transmitter is idle and idle_high=1, tx_line must stay high.",
+    "verification": {
+      "max_attempts": 3,
+      "compile": {
+        "name": "uart_compile",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/*.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": false,
+        "expected_outcome_by_mode": {
+          "baseline": "pass",
+          "candidate": "pass"
+        }
+      },
+      "targeted": {
+        "name": "uart_idle_tb",
+        "source_globs": [
+          "src/rtl/*.sv",
+          "tb/uart_idle_tb.sv"
+        ],
+        "include_dirs": [
+          "src/include"
+        ],
+        "top": "uart_idle_tb",
+        "iverilog_flags": [
+          "-g2012"
+        ],
+        "run": true,
+        "timeout_sec": 90,
+        "expected_outcome_by_mode": {
+          "baseline": "fail",
+          "candidate": "pass"
+        },
+        "markers": {
+          "pass": [
+            "PASS:"
+          ],
+          "fail": [
+            "FAIL:"
+          ]
+        }
+      },
+      "regression": [
+        {
+          "name": "uart_smoke_tb",
+          "source_globs": [
+            "src/rtl/*.sv",
+            "tb/uart_smoke_tb.sv"
+          ],
+          "include_dirs": [
+            "src/include"
+          ],
+          "top": "uart_smoke_tb",
+          "iverilog_flags": [
+            "-g2012"
+          ],
+          "run": true,
+          "timeout_sec": 90,
+          "expected_outcome_by_mode": {
+            "baseline": "pass",
+            "candidate": "pass"
+          },
+          "markers": {
+            "pass": [
+              "PASS:"
+            ],
+            "fail": [
+              "FAIL:"
+            ]
+          }
+        }
+      ]
+    }
+  }
+]
