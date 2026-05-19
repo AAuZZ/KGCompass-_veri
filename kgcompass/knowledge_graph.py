@@ -1,5 +1,6 @@
 from neo4j import GraphDatabase
 import os
+import re
 from embedding import Embedding
 from utils import relative_path, context_entity_sort_key
 from config import (
@@ -15,6 +16,8 @@ class KnowledgeGraph:
         'Macro',
         'State',
         'GenerateBlock',
+        'Branch',
+        'Condition',
         'ConditionalCompilationScope',
         'Testbench',
         'Assertion',
@@ -33,6 +36,7 @@ class KnowledgeGraph:
         'modifies': 'MODIFIES',
         'guards': 'GUARDS',
         'transitions_to': 'TRANSITIONS_TO',
+        'branches': 'BRANCHES',
         'tests': 'TESTS',
         'exercises': 'EXERCISES',
         # Generic fallback for legacy HDL helper callers.
@@ -101,6 +105,20 @@ class KnowledgeGraph:
         if not relationship_configs:
             raise ValueError("No supported relationship types exist in the KG for GDS projection.")
         return "{\n" + ",\n".join(relationship_configs) + "\n                    }"
+
+    @staticmethod
+    def _issue_text_boost_pattern(issue_text):
+        tokens = []
+        for raw in re.findall(r"\b([A-Za-z_][A-Za-z0-9_./-]{3,})\b", issue_text or ""):
+            token = raw.strip().lower()
+            if not token or token in {
+                'module', 'signal', 'always', 'assign', 'reset', 'clock', 'state',
+                'register', 'error', 'issue', 'logic', 'input', 'output', 'wire',
+                'reg', 'bit', 'byte', 'test', 'case'
+            }:
+                continue
+            tokens.append(token)
+        return list(dict.fromkeys(tokens))[:12]
 
     @classmethod
     def _merge_semantic_and_compat_relationship(
@@ -254,7 +272,7 @@ class KnowledgeGraph:
             """
             exists = session.run(exists_query, id=issue_id).single()['exists']
             
-            if exists:
+            if not exists:
                 # If issue doesn't exist, calculate embedding and create new issue
                 text_for_embedding = f"{title}\n{content}"
                 embedding = self._get_embedding(text_for_embedding)
@@ -1205,9 +1223,15 @@ class KnowledgeGraph:
                 'doc_string': record['doc_string']
             } for record in result]
 
-    def get_all_similarities_to_root(self, max_hops=2, limit=None, sort=False):
+    def get_all_similarities_to_root(self, max_hops=2, limit=None, sort=False, issue_text="", issue_mentioned_files=None):
         limit = limit or 500
         max_target_nodes = min(1000, limit * 2)
+        issue_mentioned_files = [
+            str(item or "").replace('\\', '/').strip()
+            for item in (issue_mentioned_files or [])
+            if str(item or "").strip()
+        ]
+        issue_tokens = self._issue_text_boost_pattern(issue_text)
         
         with self.driver.session() as session:
             try:
@@ -1228,7 +1252,7 @@ class KnowledgeGraph:
                 CALL gds.graph.project(
                     'graph',
                     ['Issue', 'Method', 'Class', 'File', 'Directory', 'Commit',
-                      'Signal', 'Port', 'Parameter', 'Macro', 'State', 'GenerateBlock',
+                      'Signal', 'Port', 'Parameter', 'Macro', 'State', 'Branch', 'Condition', 'GenerateBlock',
                       'ConditionalCompilationScope', 'Testbench', 'Assertion'],
                     {relationship_projection}
                 )
@@ -1243,7 +1267,7 @@ class KnowledgeGraph:
 
                 MATCH (m)
                 WHERE (m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                       OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                       OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                        OR m:Testbench OR m:Assertion
                        OR (m:Issue AND m.id <> 'root')) 
                 AND m.embedding IS NOT NULL
@@ -1259,7 +1283,7 @@ class KnowledgeGraph:
                 WITH nodeIds, totalCost, root_embedding, root_text,
                     gds.util.asNode(nodeIds[-1]) as m
                 WHERE (m:Method OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                       OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                       OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                        OR m:Testbench OR m:Assertion
                        OR (m:Class AND NOT EXISTS((m)-[:CONTAINS|RELATED]->(:Method))) OR m:Issue)
                   AND totalCost <= $max_hops
@@ -1401,6 +1425,8 @@ class KnowledgeGraph:
                         WHEN m:Parameter THEN 'parameter'
                         WHEN m:Macro THEN 'macro'
                         WHEN m:State THEN 'state'
+                        WHEN m:Branch THEN 'branch'
+                        WHEN m:Condition THEN 'condition'
                         WHEN m:GenerateBlock THEN 'generate_block'
                         WHEN m:ConditionalCompilationScope THEN 'conditional_compilation'
                         WHEN m:Testbench THEN 'testbench'
@@ -1410,52 +1436,52 @@ class KnowledgeGraph:
                     name: m.name,
                     signature: CASE WHEN m:Method THEN m.signature ELSE null END,
                     file_path: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                    OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                    OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                     OR m:Testbench OR m:Assertion THEN m.file_path ELSE null END,
                     documentation: CASE WHEN m:Method OR m:Class THEN m.doc_string ELSE null END,
                     source_code: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.source_code ELSE null END,
                     semantic_summary: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                           OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                           OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                            OR m:Testbench OR m:Assertion THEN m.semantic_summary ELSE null END,
                     repair_role: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.repair_role ELSE null END,
                     timing_tags: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.timing_tags ELSE null END,
                     timing_priority: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                          OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                          OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                           OR m:Testbench OR m:Assertion THEN m.timing_priority ELSE null END,
                     timing_summary: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                         OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                         OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                          OR m:Testbench OR m:Assertion THEN m.timing_summary ELSE null END,
                     verilog_kind: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                       OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                       OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                        OR m:Testbench OR m:Assertion THEN m.verilog_kind ELSE null END,
                     signal_name: CASE WHEN m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.signal_name ELSE null END,
                     module_name: CASE WHEN m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.module_name ELSE null END,
                     direction: CASE WHEN m:Port THEN m.direction ELSE null END,
                     width: CASE WHEN m:Signal OR m:Port OR m:Parameter THEN m.width ELSE null END,
                     declaration: CASE WHEN m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                      OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                      OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                       OR m:Testbench OR m:Assertion THEN m.declaration ELSE null END,
                     start_line: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                     OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                     OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                      OR m:Testbench OR m:Assertion THEN m.start_line ELSE null END,
                     end_line: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                   OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                   OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                    OR m:Testbench OR m:Assertion THEN m.end_line ELSE null END,
                     parse_source: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                       OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                       OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                        OR m:Testbench OR m:Assertion THEN m.parse_source ELSE null END,
                     parse_confidence: CASE WHEN m:Method OR m:Class OR m:Signal OR m:Port OR m:Parameter OR m:Macro
-                                           OR m:State OR m:GenerateBlock OR m:ConditionalCompilationScope
+                                           OR m:State OR m:Branch OR m:Condition OR m:GenerateBlock OR m:ConditionalCompilationScope
                                            OR m:Testbench OR m:Assertion THEN m.parse_confidence ELSE null END,
                     issue_id: CASE WHEN m:Issue THEN m.id ELSE null END,
                     title: CASE WHEN m:Issue THEN m.title ELSE null END,
@@ -1472,10 +1498,35 @@ class KnowledgeGraph:
                     max_hops=float(max_hops),
                     max_target_nodes=max_target_nodes,
                     VECTOR_SIMILARITY_WEIGHT=VECTOR_SIMILARITY_WEIGHT,
-                    DECAY_FACTOR=DECAY_FACTOR
+                    DECAY_FACTOR=DECAY_FACTOR,
+                    issue_tokens=issue_tokens,
+                    issue_mentioned_files=issue_mentioned_files,
                 )
                 method_record = method_result.single()
                 method_similarities = method_record['methods'] if method_record else []
+                if issue_tokens or issue_mentioned_files:
+                    for sim in method_similarities:
+                        if not isinstance(sim, dict):
+                            continue
+                        boost = 0.0
+                        file_path = str(sim.get('file_path') or '').replace('\\', '/').lower()
+                        name = str(sim.get('name') or '').lower()
+                        module_name = str(sim.get('module_name') or '').lower()
+                        signature = str(sim.get('signature') or '').lower()
+                        for token in issue_tokens:
+                            if not token:
+                                continue
+                            if token in name or token in module_name or token in signature or token in file_path:
+                                boost += 0.12
+                        for path_hint in issue_mentioned_files:
+                            hint = str(path_hint or '').replace('\\', '/').lower()
+                            if hint and (file_path == hint or file_path.endswith(hint)):
+                                boost += 0.30
+                        if boost:
+                            try:
+                                sim['similarity'] = float(sim.get('similarity') or 0.0) + boost
+                            except (TypeError, ValueError):
+                                sim['similarity'] = boost
                 
                 # 5. Process and organize results
                 results = {
@@ -1498,6 +1549,8 @@ class KnowledgeGraph:
                             'parameter',
                             'macro',
                             'state',
+                            'branch',
+                            'condition',
                             'generate_block',
                             'conditional_compilation',
                             'testbench',

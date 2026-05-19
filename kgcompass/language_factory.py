@@ -14,6 +14,11 @@ except Exception:
         VerilogAstExtractor = None
         VerilogAstUnavailable = RuntimeError
 
+try:
+    from utils import normalize_repo_path
+except Exception:
+    from .utils import normalize_repo_path
+
 # === 新增：扩展名 → 语言 的映射 ==============
 EXT_LANG_MAP = {
     '.py':   'python',
@@ -401,17 +406,7 @@ class PythonParser(BaseParser):
         super().__init__('python')
 
     def _clean_path(self, file_path: str) -> str:
-        """Removes 'playground/' prefix and the project directory from a path."""
-        rel_path = os.path.relpath(file_path)
-        prefix = 'playground' + os.sep
-        if rel_path.startswith(prefix):
-            path_after_playground = rel_path[len(prefix):]
-            parts = path_after_playground.split(os.sep)
-            if len(parts) > 1:
-                return os.sep.join(parts[1:])
-            else:
-                return path_after_playground
-        return rel_path
+        return normalize_repo_path(file_path)
 
     def get_compilation_unit(self, file_path: str):
         if file_path in self._file_ast_cache:
@@ -1511,28 +1506,7 @@ class VerilogParser(BaseParser):
         return value
 
     def _clean_path(self, file_path: str) -> str:
-        path = os.path.normpath(file_path).replace('\\', '/')
-        if os.path.isabs(path):
-            try:
-                path = os.path.relpath(path, os.getcwd()).replace('\\', '/')
-            except ValueError:
-                pass
-        if path.startswith('workdirs/'):
-            parts = path.split('/')
-            if len(parts) > 4 and parts[2] == 'repos':
-                return '/'.join(parts[4:])
-        for marker in ('playground', 'verilog_repair_cases'):
-            prefix = marker + '/'
-            if path.startswith(prefix):
-                parts = path.split('/')
-                if len(parts) > 2:
-                    return '/'.join(parts[2:])
-            marker_idx = path.find('/' + prefix)
-            if marker_idx >= 0:
-                parts = path[marker_idx + 1:].split('/')
-                if len(parts) > 2:
-                    return '/'.join(parts[2:])
-        return path
+        return normalize_repo_path(file_path)
 
     def _read_file(self, file_path):
         with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:

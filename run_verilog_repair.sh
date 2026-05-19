@@ -99,32 +99,22 @@ else
   echo "KG location saved to $KG_RESULT_FILE"
 fi
 
-LLM_RESULT_FILE="${LLM_LOCATIONS_DIR}/${INSTANCE_ID}.json"
-if [ -f "$LLM_RESULT_FILE" ]; then
-  log_stage "Stage 2/4: LLM localization skipped"
-  echo "Existing LLM location: $LLM_RESULT_FILE"
-else
-  log_stage "Stage 2/4: running LLM localization"
-  "${PYTHON_CMD[@]}" kgcompass/llm_loc.py "$LLM_LOCATIONS_DIR" --instance_id "$INSTANCE_ID" --benchmark_name verilog-local
-  echo "LLM location saved to $LLM_RESULT_FILE"
-fi
-
 FINAL_RESULT_FILE="${FINAL_LOCATIONS_DIR}/${INSTANCE_ID}.json"
 if [ -f "$FINAL_RESULT_FILE" ]; then
-  log_stage "Stage 3/4: final localization merge skipped"
+  log_stage "Stage 2/3: final localization skipped"
   echo "Existing final location: $FINAL_RESULT_FILE"
 else
-  log_stage "Stage 3/4: merging and normalizing localization results"
-  "${PYTHON_CMD[@]}" kgcompass/fix_fl_line.py "$LLM_LOCATIONS_DIR" "$FINAL_LOCATIONS_DIR" --instance_id "$INSTANCE_ID" --benchmark_name verilog-local
-  echo "Final location saved to $FINAL_RESULT_FILE"
+  log_stage "Stage 2/3: using KG localization as final localization"
+  cp "$KG_RESULT_FILE" "$FINAL_RESULT_FILE"
+  echo "Final location copied from KG location to $FINAL_RESULT_FILE"
 fi
 
 PATCH_FILE="${PATCH_DIR}/${INSTANCE_ID}.patch"
 if [ -f "$PATCH_FILE" ]; then
-  log_stage "Stage 4/4: repair skipped"
+  log_stage "Stage 3/3: repair skipped"
   echo "Existing final patch: $PATCH_FILE"
 else
-  log_stage "Stage 4/4: running generation/debug repair loop"
+  log_stage "Stage 3/3: running generation/debug repair loop"
   : > "$REPAIR_PROGRESS_LOG"
   export KGCOMPASS_REPAIR_PROGRESS_LOG="$REPAIR_PROGRESS_LOG"
   echo "Repair progress will also be written to: $REPAIR_PROGRESS_LOG"

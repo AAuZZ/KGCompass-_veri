@@ -227,6 +227,9 @@ class VerilogAstExtractor:
                 add_entity(entity)
 
             methods = self._extract_module_members(parsed, region, signal_index)
+            control_flow_entities = []
+            control_flow_method_edges = []
+            control_flow_signal_edges = []
             methods = [
                 self._annotate_with_timing_hints(
                     method,
@@ -241,6 +244,17 @@ class VerilogAstExtractor:
                 verilog_kind = method.get("verilog_kind", "")
                 if verilog_kind == "module_body":
                     continue
+                cf_entities, cf_method_edges, cf_signal_edges = self._extract_control_flow_artifacts(
+                    parsed,
+                    region,
+                    method,
+                    signal_index,
+                )
+                for entity in cf_entities:
+                    add_entity(entity)
+                control_flow_entities.extend(cf_entities)
+                control_flow_method_edges.extend(cf_method_edges)
+                control_flow_signal_edges.extend(cf_signal_edges)
                 usage = self._analyze_signal_usage(
                     method.get("source_code", ""),
                     signal_index,
@@ -328,8 +342,10 @@ class VerilogAstExtractor:
                             "relation_kind": "exercises",
                             "parse_source": "heuristic",
                             "parse_confidence": 0.7,
-                        })
+                            })
 
+            method_signal_edges.extend(control_flow_method_edges)
+            signal_edges.extend(control_flow_signal_edges)
             for edge in region.get("state_edges", []):
                 signal_edges.append(edge)
 
@@ -691,6 +707,168 @@ class VerilogAstExtractor:
                 "parse_confidence": 0.88,
             })
         return self._dedupe_entities(entities)
+
+    def _extract_control_flow_artifacts(self, parsed: VerilogAstFile, region: dict, method: dict, signal_index: dict) -> tuple[list[dict], list[dict], list[dict]]:
+        source_lines = (method.get("source_code") or "").splitlines()
+        if not source_lines:
+            return [], [], []
+
+        module_name = region["name"]
+        base_line = int(method.get("start_line") or region.get("start_line") or 1)
+        branch_entities = []
+        method_edges = []
+        hdl_edges = []
+        seen_branch = set()
+        seen_condition = set()
+
+        def add_branch(branch_kind: str, expr: str, line_no: int, span_end: int = None):
+            expr = (expr or "").strip()
+            key = (branch_kind, line_no, expr)
+            if key in seen_branch:
+                return None
+            seen_branch.add(key)
+            branch_name = f"{module_name}.{method.get('verilog_kind', 'rtl')}.branch@{line_no}"
+            branch_entity = {
+                "label": "Branch",
+                "name": branch_name,
+                "file_path": region["file_path"],
+                "module_name": module_name,
+                "rtl_kind": branch_kind,
+                "verilog_kind": "branch",
+                "signal_name": branch_kind,
+                "direction": "",
+                "width": "",
+                "declaration": expr or branch_kind,
+                "start_line": line_no,
+                "end_line": span_end or line_no,
+                "source_code": expr or branch_kind,
+                "semantic_summary": (
+                    f"Branch {branch_name}; module={module_name}; "
+                    f"method={method.get('signature', '')}; branch_kind={branch_kind}; "
+                    f"condition={expr or 'none'}"
+                ),
+                "parse_source": "heuristic",
+                "parse_confidence": 0.72,
+            }
+            branch_entities.append(branch_entity)
+            method_edges.append({
+                "method_name": method["name"],
+                "method_signature": method["signature"],
+                "method_file_path": method["file_path"],
+                "target_label": "Branch",
+                "target_name": branch_name,
+                "target_file_path": region["file_path"],
+                "target_module_name": module_name,
+                "description": f"{branch_kind} branch",
+                "reverse_description": f"branched from {method.get('verilog_kind', 'rtl')}",
+                "relation_kind": "branches",
+                "parse_source": "heuristic",
+                "parse_confidence": 0.78,
+            })
+            return branch_entity
+
+        def add_condition(branch_entity: dict, expr: str, line_no: int, branch_kind: str):
+            expr = (expr or "").strip()
+            normalized_expr = re.sub(r"\s+", " ", expr)
+            if not normalized_expr:
+                return None
+            key = (branch_kind, line_no, normalized_expr)
+            if key in seen_condition:
+                return None
+            seen_condition.add(key)
+            cond_name = f"{module_name}.{method.get('verilog_kind', 'rtl')}.cond@{line_no}"
+            signal_names = sorted(self._extract_identifiers(normalized_expr) & set(signal_index.keys()))
+            condition_entity = {
+                "label": "Condition",
+                "name": cond_name,
+                "file_path": region["file_path"],
+                "module_name": module_name,
+                "rtl_kind": branch_kind,
+                "verilog_kind": "condition",
+                "signal_name": signal_names[0] if signal_names else normalized_expr,
+                "direction": "",
+                "width": "",
+                "declaration": normalized_expr,
+                "start_line": line_no,
+                "end_line": line_no,
+                "source_code": normalized_expr,
+                "semantic_summary": (
+                    f"Condition {cond_name}; module={module_name}; "
+                    f"branch_kind={branch_kind}; expr={normalized_expr}; "
+                    f"signals={', '.join(signal_names) if signal_names else 'none'}"
+                ),
+                "parse_source": "heuristic",
+                "parse_confidence": 0.7,
+            }
+            branch_entities.append(condition_entity)
+            hdl_edges.append({
+                "source_label": "Branch",
+                "source_name": branch_entity["name"],
+                "source_file_path": branch_entity["file_path"],
+                "source_module_name": branch_entity.get("module_name", ""),
+                "target_label": "Condition",
+                "target_name": cond_name,
+                "target_file_path": condition_entity["file_path"],
+                "target_module_name": module_name,
+                "description": "guards condition",
+                "reverse_description": "condition guarded by branch",
+                "relation_kind": "guards",
+                "parse_source": "heuristic",
+                "parse_confidence": 0.75,
+            })
+            for signal_name in signal_names:
+                signal_entity = signal_index.get(signal_name)
+                if not signal_entity:
+                    continue
+                hdl_edges.append({
+                    "source_label": "Condition",
+                    "source_name": cond_name,
+                    "source_file_path": condition_entity["file_path"],
+                    "source_module_name": module_name,
+                    "target_label": signal_entity["label"],
+                    "target_name": signal_entity["name"],
+                    "target_file_path": signal_entity["file_path"],
+                    "target_module_name": signal_entity.get("module_name", ""),
+                    "description": "reads signal",
+                    "reverse_description": "read by condition",
+                    "relation_kind": "reads",
+                    "parse_source": "heuristic",
+                    "parse_confidence": 0.68,
+                })
+            return condition_entity
+
+        for local_idx, raw_line in enumerate(source_lines, start=1):
+            abs_line = base_line + local_idx - 1
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+
+            if stripped.startswith("if ") or stripped.startswith("if(") or stripped.startswith("else if") or stripped.startswith("else if("):
+                branch_kind = "if"
+                expr_match = re.search(r"\b(?:else\s+)?if\s*\((.*?)\)", stripped)
+                expr = expr_match.group(1) if expr_match else ""
+                branch_entity = add_branch(branch_kind, expr, abs_line, abs_line)
+                if branch_entity is not None:
+                    add_condition(branch_entity, expr, abs_line, branch_kind)
+                continue
+
+            if stripped.startswith("case ") or stripped.startswith("case(") or re.match(r"^\b(?:unique|priority)\s+case\b", stripped):
+                branch_kind = "case"
+                expr_match = re.search(r"\bcase\s*\((.*?)\)", stripped)
+                expr = expr_match.group(1) if expr_match else ""
+                branch_entity = add_branch(branch_kind, expr, abs_line, abs_line)
+                if branch_entity is not None:
+                    add_condition(branch_entity, expr, abs_line, branch_kind)
+                continue
+
+            if re.match(r"^(?:default\s*:|[A-Za-z0-9_'`\[\]\s\-\+\*\/\&\|\^\~]+:)\s*$", stripped):
+                branch_kind = "case_item"
+                expr = stripped.rstrip(":").strip()
+                branch_entity = add_branch(branch_kind, expr, abs_line, abs_line)
+                if branch_entity is not None:
+                    add_condition(branch_entity, expr, abs_line, branch_kind)
+
+        return self._dedupe_entities(branch_entities), method_edges, hdl_edges
 
     def _extract_states(self, parsed: VerilogAstFile, region: dict, signal_index: dict) -> tuple[list[dict], list[dict]]:
         state_signals = {name for name in signal_index if "state" in name.lower()}

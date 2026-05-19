@@ -34,6 +34,14 @@ from utils import (
 from verilog_validation import VerilogValidationRunner
 from experience_store import ExperienceStore
 try:
+    from verilog_kg_digest import build_verilog_bug_kg_digest
+except Exception:
+    from .verilog_kg_digest import build_verilog_bug_kg_digest
+try:
+    from verilog_kg_slice import build_verilog_fault_neighborhood
+except Exception:
+    from .verilog_kg_slice import build_verilog_fault_neighborhood
+try:
     from verilog_timing import annotate_verilog_entity, classify_verilog_location_groups, normalize_verilog_related_entities
 except Exception:
     from .verilog_timing import annotate_verilog_entity, classify_verilog_location_groups, normalize_verilog_related_entities
@@ -266,6 +274,9 @@ class CodeRepair:
 
         if language == "verilog":
             group_order = [
+                ("fault_anchor_entities", "Fault Anchor Entities"),
+                ("repair_anchor_entities", "Repair Anchor Entities"),
+                ("edit_targets", "Editable RTL Targets"),
                 ("direct_drivers", "Direct Drivers"),
                 ("top_level_wiring", "Top-Level Wiring"),
                 ("config_registers", "Config Registers"),
@@ -302,14 +313,16 @@ class CodeRepair:
     def _truncate_entity_groups(self, grouped_entities, language="python"):
         if language == "verilog":
             limits = {
+                "fault_anchor_entities": 6,
+                "repair_anchor_entities": 6,
                 "edit_targets": 8,
                 "direct_drivers": 6,
                 "top_level_wiring": 6,
                 "config_registers": 4,
-                "evidence_entities": 10,
-                "methods": 8,
-                "rtl_entities": 10,
-                "issues": 4,
+            "evidence_entities": 10,
+            "methods": 8,
+            "rtl_entities": 10,
+            "issues": 4,
             }
         else:
             limits = {
@@ -340,12 +353,198 @@ class CodeRepair:
             excerpt.append(f"{line_no}: {lines[line_no - 1]}")
         return "\n".join(excerpt)
 
-    def _collect_candidate_source_context(self, repo_path, related, language="python", max_files=3, full_file_limit=400, window=100):
+    def _extract_verilog_issue_file_hints(self, problem_statement, repo_path="", related=None, limit=8):
+        text = problem_statement or ""
+        hints = []
+        seen = set()
+
+        def add_hint(file_path):
+            normalized = str(file_path or "").replace("\\", "/").strip()
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            hints.append(normalized)
+
+        related_files = []
+        for group_entities in (related or {}).values():
+            for entity in group_entities or []:
+                file_path = str(entity.get("file_path") or "").replace("\\", "/").strip()
+                if file_path:
+                    related_files.append(file_path)
+        related_files = _unique_keep_order(related_files)
+
+        file_patterns = [
+            r"`([^`]+\.(?:sv|svh|v|vh))`",
+            r"(?<![\w./-])([A-Za-z0-9_./-]+\.(?:sv|svh|v|vh))\b",
+        ]
+        raw_hints = []
+        for pattern in file_patterns:
+            raw_hints.extend(match.group(1).strip() for match in re.finditer(pattern, text, flags=re.IGNORECASE))
+
+        module_like_tokens = []
+        for token in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{4,})\b", text):
+            token = token.strip()
+            if not token or token.lower() in {
+                "module",
+                "signal",
+                "output",
+                "input",
+                "always",
+                "assign",
+                "reset",
+                "clock",
+                "error",
+                "issue",
+                "logic",
+                "state",
+                "register",
+            }:
+                continue
+            if "_" not in token and not any(ch.isdigit() for ch in token):
+                continue
+            module_like_tokens.append(token)
+        module_like_tokens = _unique_keep_order(module_like_tokens)[:12]
+
+        def repo_file_candidates():
+            if not repo_path or not os.path.isdir(repo_path):
+                return []
+            candidates = []
+            for root, _, files in os.walk(repo_path):
+                for filename in files:
+                    if not re.search(r"\.(?:sv|svh|v|vh)$", filename, re.IGNORECASE):
+                        continue
+                    rel_path = os.path.relpath(os.path.join(root, filename), repo_path).replace("\\", "/")
+                    candidates.append(rel_path)
+            return _unique_keep_order(candidates)
+
+        repo_candidates = repo_file_candidates()
+
+        for raw_hint in raw_hints:
+            normalized = raw_hint.replace("\\", "/").strip("`'\" ")
+            if not normalized:
+                continue
+            if re.search(r"\.(?:sv|svh|v|vh)$", normalized, re.IGNORECASE):
+                if repo_path:
+                    abs_hint = os.path.abspath(os.path.join(repo_path, *normalized.split("/")))
+                    if os.path.exists(abs_hint):
+                        add_hint(os.path.relpath(abs_hint, repo_path).replace("\\", "/"))
+                        continue
+                basename = os.path.splitext(os.path.basename(normalized))[0].lower()
+                for candidate in [*related_files, *repo_candidates]:
+                    candidate_base = os.path.splitext(os.path.basename(candidate))[0].lower()
+                    if candidate_base == basename:
+                        add_hint(candidate)
+                        break
+                else:
+                    add_hint(normalized)
+                continue
+
+            token_lower = normalized.lower()
+            for candidate in [*related_files, *repo_candidates]:
+                candidate_base = os.path.splitext(os.path.basename(candidate))[0].lower()
+                candidate_path = candidate.lower()
+                if (
+                    candidate_base == token_lower
+                    or token_lower in candidate_base
+                    or candidate_base in token_lower
+                    or token_lower in candidate_path
+                ):
+                    add_hint(candidate)
+                    break
+
+        for token in module_like_tokens:
+            token_lower = token.lower()
+            for candidate in [*related_files, *repo_candidates]:
+                candidate_base = os.path.splitext(os.path.basename(candidate))[0].lower()
+                candidate_path = candidate.lower()
+                if (
+                    candidate_base == token_lower
+                    or token_lower in candidate_base
+                    or candidate_base in token_lower
+                    or token_lower in candidate_path
+                ):
+                    add_hint(candidate)
+                    break
+            if len(hints) >= limit:
+                break
+
+        return hints[:limit]
+
+    def _collect_candidate_source_context(
+        self,
+        repo_path,
+        related,
+        language="python",
+        max_files=5,
+        full_file_limit=400,
+        window=100,
+        fault_anchor_entities=None,
+        repair_anchor_entities=None,
+        fault_anchor_spans=None,
+        preferred_files=None,
+    ):
         if language != "verilog" or not repo_path:
             return ""
 
         ranked_entities = []
-        for group_name in ("direct_drivers", "edit_targets", "top_level_wiring", "config_registers", "methods"):
+        preferred_files = _unique_keep_order([
+            str(path or "").replace("\\", "/").strip()
+            for path in (preferred_files or [])
+            if str(path or "").strip()
+        ])
+        fault_anchor_entities = list(fault_anchor_entities or [])
+        repair_anchor_entities = list(repair_anchor_entities or [])
+        fault_anchor_spans = list(fault_anchor_spans or [])
+        anchor_file_spans = {}
+        for span in fault_anchor_spans:
+            if not isinstance(span, dict):
+                continue
+            file_path = str(span.get("file_path") or "").replace("\\", "/").strip()
+            if not file_path:
+                continue
+            try:
+                start_line = int(span.get("start_line") or 0)
+                end_line = int(span.get("end_line") or 0)
+            except (TypeError, ValueError):
+                start_line = end_line = 0
+            if start_line <= 0 or end_line <= 0:
+                continue
+            anchor_file_spans.setdefault(file_path, []).append((start_line, end_line))
+
+        for entity in repair_anchor_entities:
+            file_path = str(entity.get("file_path") or "").replace("\\", "/")
+            if not file_path or file_path.startswith("tb/"):
+                continue
+            if not re.search(r"\.(?:sv|v|svh|vh)$", file_path, re.IGNORECASE):
+                continue
+            ranked_entities.append(("repair_anchor", entity))
+
+        for file_path, spans in anchor_file_spans.items():
+            for start_line, end_line in spans[:max_files]:
+                ranked_entities.append((
+                    "fault_anchor",
+                    {
+                        "file_path": file_path,
+                        "start_line": start_line,
+                        "end_line": end_line,
+                        "name": "validation_failure_anchor",
+                        "signature": f"{file_path}:{start_line}-{end_line}",
+                        "repair_role": "fault_anchor",
+                        "verilog_kind": "fault_anchor",
+                        "semantic_summary": "Validation failure anchor window",
+                        "source_code": "",
+                    },
+                ))
+
+        for entity in fault_anchor_entities:
+            file_path = str(entity.get("file_path") or "").replace("\\", "/")
+            if not file_path or file_path.startswith("tb/"):
+                continue
+            if not re.search(r"\.(?:sv|v|svh|vh)$", file_path, re.IGNORECASE):
+                continue
+            ranked_entities.append(("fault_anchor", entity))
+
+        for group_name in ("direct_drivers", "edit_targets", "top_level_wiring", "config_registers", "methods", "rtl_entities"):
             for entity in related.get(group_name) or []:
                 file_path = str(entity.get("file_path") or "").replace("\\", "/")
                 if not file_path or file_path.startswith("tb/"):
@@ -355,6 +554,25 @@ class CodeRepair:
                 ranked_entities.append((group_name, entity))
 
         selected = {}
+        for file_path in preferred_files:
+            if not file_path:
+                continue
+            selected.setdefault(file_path, {"group": "issue_mentioned", "entities": []})
+
+        if fault_anchor_entities:
+            for entity in fault_anchor_entities:
+                file_path = str(entity.get("file_path") or "").replace("\\", "/")
+                if not file_path:
+                    continue
+                selected.setdefault(file_path, {"group": "fault_anchor", "entities": []})
+
+        if repair_anchor_entities:
+            for entity in repair_anchor_entities:
+                file_path = str(entity.get("file_path") or "").replace("\\", "/")
+                if not file_path:
+                    continue
+                selected.setdefault(file_path, {"group": "repair_anchor", "entities": []})
+
         for group_name, entity in ranked_entities:
             file_path = str(entity.get("file_path") or "").replace("\\", "/")
             if file_path in selected:
@@ -380,9 +598,12 @@ class CodeRepair:
             if not lines:
                 continue
 
-            if len(lines) <= full_file_limit:
+            force_full_file = file_path in preferred_files or file_path in anchor_file_spans
+            if force_full_file or len(lines) <= full_file_limit:
                 start_line, end_line = 1, len(lines)
-                mode = "full_file"
+                mode = "full_file_preferred" if force_full_file else "full_file"
+                if file_path in anchor_file_spans:
+                    mode = "full_file_fault_anchor"
             else:
                 starts = []
                 ends = []
@@ -396,11 +617,17 @@ class CodeRepair:
                         starts.append(start)
                     if end >= start and end > 0:
                         ends.append(end)
+                if file_path in anchor_file_spans:
+                    for start, end in anchor_file_spans[file_path]:
+                        starts.append(start)
+                        ends.append(end)
                 anchor_start = min(starts) if starts else 1
                 anchor_end = max(ends) if ends else anchor_start
                 start_line = max(1, anchor_start - window)
                 end_line = min(len(lines), anchor_end + window)
                 mode = f"window_around_candidates_{window}"
+                if file_path in anchor_file_spans:
+                    mode = f"window_around_fault_anchor_{window}"
 
             entity_lines = []
             for entity in info["entities"][:5]:
@@ -409,12 +636,16 @@ class CodeRepair:
                     f"{entity.get('signature') or entity.get('name')} "
                     f"[{entity.get('repair_role') or entity.get('verilog_kind') or entity.get('type') or 'unknown'}]"
                 )
+            anchor_lines = []
+            for start_line_anchor, end_line_anchor in anchor_file_spans.get(file_path, [])[:5]:
+                anchor_lines.append(f"- fault_anchor_span: {file_path}:{start_line_anchor}-{end_line_anchor}")
 
             sections.append(
                 "\n".join([
                     f"### {file_path}",
                     f"- source_mode: {mode}",
                     f"- shown_lines: {start_line}-{end_line}",
+                    *anchor_lines,
                     "- candidate_entities:",
                     *entity_lines,
                     "```verilog",
@@ -444,14 +675,18 @@ class CodeRepair:
         repo_path,
         diagnosis,
         fallback_context="",
+        failure_file_path="",
         max_files=5,
-        full_file_limit=400,
+        full_file_limit=800,
         window=100,
     ):
         if not repo_path:
             return fallback_context
 
         requested = []
+        failure_file_path = str(failure_file_path or "").replace("\\", "/").strip()
+        if failure_file_path and re.search(r"\.(?:sv|v|svh|vh)$", failure_file_path, re.IGNORECASE):
+            requested.append(failure_file_path)
         for path in diagnosis.get("need_files") or []:
             path = str(path or "").replace("\\", "/").strip()
             if path and re.search(r"\.(?:sv|v|svh|vh)$", path, re.IGNORECASE):
@@ -488,9 +723,10 @@ class CodeRepair:
             if not lines:
                 continue
 
-            if len(lines) <= full_file_limit:
+            force_full_file = file_path in requested
+            if force_full_file or len(lines) <= full_file_limit:
                 start_line, end_line = 1, len(lines)
-                mode = "full_file_requested_by_debug_diagnosis"
+                mode = "full_file_requested_by_debug_diagnosis" if force_full_file else "full_file"
             else:
                 hits = []
                 for idx, line in enumerate(lines, start=1):
@@ -523,96 +759,15 @@ class CodeRepair:
     def _format_debug_kg_context(self, related, analysis=None, limit_per_group=6):
         if not related:
             return ""
-
-        observed = str(getattr(analysis, "observed_signal", "") or "").lower()
-        issue_keywords = set()
-        for issue in related.get("issues") or []:
-            text = " ".join(str(issue.get(k) or "") for k in ("title", "content", "name"))
-            issue_keywords.update(token.lower() for token in re.findall(r"[A-Za-z_][A-Za-z0-9_$]*", text))
-        if observed:
-            issue_keywords.add(observed)
-
-        def entity_text(entity):
-            path = str(entity.get("file_path") or "").replace("\\", "/")
-            lines = ""
-            if entity.get("start_line") or entity.get("end_line"):
-                lines = f":{entity.get('start_line')}-{entity.get('end_line')}"
-            name = entity.get("signature") or entity.get("name") or entity.get("signal_name") or ""
-            kind = entity.get("repair_role") or entity.get("verilog_kind") or entity.get("type") or ""
-            summary = entity.get("semantic_summary") or entity.get("declaration") or entity.get("source_code") or ""
-            summary = _compact_text(str(summary).replace("\n", " "), 220)
-            return f"- {path}{lines} {name} [{kind}] {summary}".strip()
-
-        def relevance(entity):
-            text = " ".join(
-                str(entity.get(k) or "")
-                for k in ("file_path", "signature", "name", "signal_name", "semantic_summary", "declaration", "source_code")
-            ).lower()
-            score = 0
-            if observed and observed in text:
-                score += 5
-            for keyword in ("cpol", "cpha", "sck", "ctrl", "shifter", "regs", "top"):
-                if keyword in text:
-                    score += 2
-            score += sum(1 for kw in issue_keywords if len(kw) > 3 and kw in text)
-            return score
-
-        sections = ["This is a compact KG-derived structure index. Use it to navigate cross-file RTL signal propagation; validation evidence has priority."]
-
-        group_specs = [
-            ("direct_drivers", "Direct Drivers"),
-            ("top_level_wiring", "Top-Level Wiring"),
-            ("config_registers", "Config/Register Evidence"),
-            ("edit_targets", "Editable RTL Targets"),
-            ("evidence_entities", "Evidence Entities"),
-            ("rtl_entities", "Legacy RTL Entities"),
-        ]
-        seen_lines = set()
-        for group_name, title in group_specs:
-            entities = related.get(group_name) or []
-            if not entities:
-                continue
-            ranked = sorted(entities, key=relevance, reverse=True)
-            lines = []
-            for entity in ranked:
-                line = entity_text(entity)
-                if line in seen_lines:
-                    continue
-                if relevance(entity) <= 0 and len(lines) >= 2:
-                    continue
-                lines.append(line)
-                seen_lines.add(line)
-                if len(lines) >= limit_per_group:
-                    break
-            if lines:
-                sections.append(f"\n{title}:")
-                sections.extend(lines)
-
-        path_lines = []
-        for group_name in ("direct_drivers", "top_level_wiring", "config_registers", "edit_targets", "evidence_entities", "rtl_entities"):
-            for entity in related.get(group_name) or []:
-                if len(path_lines) >= 10:
-                    break
-                for step in entity.get("path") or []:
-                    if not isinstance(step, dict):
-                        continue
-                    relation = step.get("type") or step.get("relation_kind") or ""
-                    start = step.get("start_node") or ""
-                    end = step.get("end_node") or ""
-                    desc = step.get("description") or ""
-                    text = f"- {start} -[{relation}:{desc}]-> {end}"
-                    low = text.lower()
-                    if observed and observed not in low and not any(k in low for k in ("cpol", "cpha", "sck", "shifter", "regs", "top")):
-                        continue
-                    if text not in path_lines:
-                        path_lines.append(text)
-                if len(path_lines) >= 10:
-                    break
-        if path_lines:
-            sections.append("\nKG Path Hints:")
-            sections.extend(path_lines[:10])
-
-        return "\n".join(sections)
+        digest = build_verilog_fault_neighborhood(
+            related,
+            issue_text="",
+            analysis=analysis,
+            repo_root="",
+            limit_per_group=limit_per_group,
+            max_paths=10,
+        )
+        return digest.get("text", "")
 
     def _build_debug_patch_prompt(
         self,
@@ -628,7 +783,6 @@ class CodeRepair:
         baseline_note,
         candidate_repo_path,
         language,
-        debug_kg_context="",
     ):
         if language != "verilog":
             return self.prompt_builder.build_debug_prompt(
@@ -646,7 +800,6 @@ class CodeRepair:
         diagnosis_prompt = self.prompt_builder.build_debug_diagnosis_prompt(
             problem_statement=problem_statement,
             candidate_source_context=candidate_source_context,
-            debug_kg_context=debug_kg_context,
             analysis=analysis,
             prior_attempts=prior_attempts,
             baseline_note=baseline_note,
@@ -676,13 +829,13 @@ class CodeRepair:
             candidate_repo_path,
             diagnosis,
             fallback_context=candidate_source_context,
+            failure_file_path=str(getattr(analysis, "failure_file_path", "") or ""),
         )
         _log("debug-context", f"expanded_context_chars={len(expanded_context or '')}")
         return self.prompt_builder.build_debug_patch_prompt(
             problem_statement=problem_statement,
             expanded_source_context=expanded_context,
             diagnosis=diagnosis,
-            debug_kg_context=debug_kg_context,
             hard_constraints=hard_constraints,
             language_prompt_parts=language_prompt_parts,
             attempt_index=attempt_index,
@@ -760,6 +913,7 @@ class CodeRepair:
                 ("Direct drivers:", "direct_drivers"),
                 ("Top-level wiring:", "top_level_wiring"),
                 ("Config registers:", "config_registers"),
+                ("Repair anchors:", "repair_anchor_entities"),
             ]:
                 group_entities = related.get(group_name) or []
                 if not group_entities:
@@ -771,17 +925,47 @@ class CodeRepair:
                         f"{entity.get('signature') or entity.get('name', '')} "
                         f"[{entity.get('repair_role') or entity.get('verilog_kind') or 'unknown'}]"
                     )
+        issue_mentioned_files = []
+        if language == "verilog":
+            issue_mentioned_files = self._extract_verilog_issue_file_hints(
+                problem_statement,
+                repo_path=repo_path or "",
+                related=related,
+            )
+            if issue_mentioned_files:
+                localized_summary.append(f"Issue-mentioned files: {', '.join(issue_mentioned_files[:8])}")
         if evidence_lines:
             localized_summary.append("Evidence entities:")
             localized_summary.extend(evidence_lines)
         if files:
             localized_summary.append(f"Candidate files: {', '.join(files[:8])}")
         localization_summary = "\n".join(localized_summary)
+        bug_kg_digest = {}
+        if language == "verilog":
+            bug_kg_digest = build_verilog_fault_neighborhood(
+                related,
+                issue_text=problem_statement,
+                analysis=None,
+                repo_root=repo_path or "",
+            )
+
+        fault_anchor_entities = bug_kg_digest.get("fault_anchor_entities") or []
+        repair_anchor_entities = bug_kg_digest.get("repair_anchor_entities") or []
+        fault_anchor_spans = bug_kg_digest.get("fault_anchor_spans") or []
 
         grouped_entities = self._truncate_entity_groups(self._group_entities_for_prompt(related, language=language), language=language)
+        if language == "verilog" and (fault_anchor_entities or repair_anchor_entities or fault_anchor_spans):
+            prompt_related = dict(related)
+            prompt_related["fault_anchor_entities"] = fault_anchor_entities
+            prompt_related["repair_anchor_entities"] = repair_anchor_entities
+            prompt_related["edit_targets"] = prompt_related.get("edit_targets") or prompt_related.get("direct_drivers") or []
+            grouped_entities = self._truncate_entity_groups(self._group_entities_for_prompt(prompt_related, language=language), language=language)
         header_map = {
+            "fault_anchor_entities": "Fault Anchor Entities",
+            "repair_anchor_entities": "Repair Anchor Entities",
             "methods": "Relevant Methods",
             "classes": "Relevant Classes",
+            "edit_targets": "Editable RTL Targets",
             "direct_drivers": "Direct Drivers",
             "top_level_wiring": "Top-Level Wiring",
             "config_registers": "Config Registers",
@@ -791,9 +975,9 @@ class CodeRepair:
             "issues": "Related Issues",
         }
         current_edit_targets = self._render_grouped_entities(
-            [(name, entities) for name, entities in grouped_entities if name in {"edit_targets"}],
+            [(name, entities) for name, entities in grouped_entities if name in {"fault_anchor_entities", "repair_anchor_entities", "edit_targets"}],
             header_map,
-            show_path_groups={"edit_targets"},
+            show_path_groups={"fault_anchor_entities", "repair_anchor_entities", "edit_targets"},
         )
         if not current_edit_targets:
             current_edit_targets = self._render_grouped_entities(
@@ -807,6 +991,16 @@ class CodeRepair:
             show_path_groups={"evidence_entities", "rtl_entities"},
         )
         candidate_source_context = self._collect_candidate_source_context(repo_path, related, language=language)
+        if language == "verilog" and (fault_anchor_entities or repair_anchor_entities or fault_anchor_spans):
+            candidate_source_context = self._collect_candidate_source_context(
+                repo_path,
+                related,
+                language=language,
+                fault_anchor_entities=fault_anchor_entities,
+                repair_anchor_entities=repair_anchor_entities,
+                fault_anchor_spans=fault_anchor_spans,
+                preferred_files=issue_mentioned_files,
+            ) or candidate_source_context
 
         tests = []
         targeted = verification_cfg.get("targeted") or {}
@@ -834,12 +1028,18 @@ class CodeRepair:
             "current_edit_targets": current_edit_targets,
             "evidence_entities": evidence_entities_text,
             "candidate_source_context": candidate_source_context,
+            "fault_anchor_entities": fault_anchor_entities,
+            "repair_anchor_entities": repair_anchor_entities,
+            "fault_anchor_spans": fault_anchor_spans,
             "files": files,
+            "issue_mentioned_files": issue_mentioned_files,
             "tests": tests,
             "edit_target_kinds": edit_target_kinds,
             "evidence_kinds": evidence_kinds,
             "hard_constraints": hard_constraints,
             "related_entities": related,
+            "bug_kg_digest": bug_kg_digest,
+            "bug_kg_digest_text": bug_kg_digest.get("text", "") if bug_kg_digest else "",
         }
 
     def _collect_retrieval_memory(self, instance_id, prompt_context, failure_signature="", benchmark_name="verilog-local"):
@@ -1219,9 +1419,6 @@ class CodeRepair:
 
         prompt = self.prompt_builder.build_generation_prompt(
             problem_statement=problem_statement,
-            localization_summary=localization_summary,
-            current_edit_targets=current_edit_targets,
-            evidence_entities=evidence_entities,
             candidate_source_context=candidate_source_context,
             hard_constraints=hard_constraints,
             language_prompt_parts=language_prompt_parts,
@@ -1260,11 +1457,6 @@ class CodeRepair:
             candidate_repo_workdir, candidate_repo_path = self._clone_repo_to_attempt_root(clone_source_repo_path, attempts_root)
             _log("workspace", f"candidate_repo={candidate_repo_path}")
             if language == "verilog" and phase == "debug":
-                debug_kg_context = self._format_debug_kg_context(
-                    prompt_context.get("related_entities") or {},
-                    analysis=current_analysis,
-                )
-                _log("debug-kg", f"context_chars={len(debug_kg_context or '')}")
                 prompt = self._build_debug_patch_prompt(
                     problem_statement=problem_statement,
                     candidate_source_context=candidate_source_context,
@@ -1277,7 +1469,6 @@ class CodeRepair:
                     baseline_note=baseline_note,
                     candidate_repo_path=candidate_repo_path,
                     language=language,
-                    debug_kg_context=debug_kg_context,
                 )
             stream = self.get_completion(prompt, stream=True)
             if not stream:
@@ -1296,9 +1487,6 @@ class CodeRepair:
                     generation_attempt_index += 1
                     prompt = self.prompt_builder.build_generation_prompt(
                         problem_statement=problem_statement,
-                        localization_summary=localization_summary,
-                        current_edit_targets=current_edit_targets,
-                        evidence_entities=evidence_entities,
                         candidate_source_context=candidate_source_context,
                         hard_constraints=hard_constraints,
                         language_prompt_parts=language_prompt_parts,
@@ -1429,9 +1617,6 @@ class CodeRepair:
                         if generation_attempt_index <= generation_max_attempts:
                             prompt = self.prompt_builder.build_generation_prompt(
                                 problem_statement=problem_statement,
-                                localization_summary=localization_summary,
-                                current_edit_targets=current_edit_targets,
-                                evidence_entities=evidence_entities,
                                 candidate_source_context=candidate_source_context,
                                 hard_constraints=hard_constraints,
                                 language_prompt_parts=language_prompt_parts,

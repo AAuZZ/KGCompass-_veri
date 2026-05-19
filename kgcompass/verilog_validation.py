@@ -53,6 +53,7 @@ class ValidationStepResult:
     run_stderr_path: str = ""
     vvp_output_path: str = ""
     vcd_output_path: str = ""
+    failure_file_path: str = ""
     failure_line_number: int = 0
     stimulus_window: str = ""
     timing_signature: str = ""
@@ -371,6 +372,7 @@ class VerilogValidationRunner:
         self._write_text(compile_stdout_path, compile_run["stdout"])
         self._write_text(compile_stderr_path, compile_run["stderr"])
         compile_warnings = self._extract_compile_warnings(f"{compile_run['stdout']}\n{compile_run['stderr']}")
+        compile_failure_path, compile_failure_line_number = self._extract_failure_location(f"{compile_run['stdout']}\n{compile_run['stderr']}")
 
         compile_passed = compile_run["returncode"] == 0
         if not compile_passed:
@@ -391,6 +393,8 @@ class VerilogValidationRunner:
                 run_stderr_path="",
                 vvp_output_path=vvp_output,
                 vcd_output_path=vcd_output_path,
+                failure_file_path=compile_failure_path,
+                failure_line_number=compile_failure_line_number,
                 summary="compile failed",
                 compile_stdout_excerpt=compile_run["stdout_excerpt"],
                 compile_stderr_excerpt=compile_run["stderr_excerpt"],
@@ -419,6 +423,8 @@ class VerilogValidationRunner:
                     run_stderr_path="",
                     vvp_output_path=vvp_output,
                     vcd_output_path=vcd_output_path,
+                    failure_file_path=compile_failure_path,
+                    failure_line_number=compile_failure_line_number,
                     summary="compile warning indicates interface mismatch",
                     compile_stdout_excerpt=compile_run["stdout_excerpt"],
                     compile_stderr_excerpt=compile_run["stderr_excerpt"],
@@ -542,6 +548,7 @@ class VerilogValidationRunner:
             run_stderr_path=run_stderr_path,
             vvp_output_path=vvp_output,
             vcd_output_path=vcd_output_path,
+            failure_file_path=failure_path,
             failure_line_number=failure_line_number,
             stimulus_window=timing_hint.get("stimulus_window") or stimulus_window,
             timing_signature=timing_signature,

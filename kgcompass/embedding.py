@@ -1,57 +1,81 @@
+from __future__ import annotations
+
 import traceback
-from transformers import AutoModel
+
 import numpy as np
+import torch
+from transformers import AutoModel, AutoTokenizer
+
 
 class Embedding:
     _instance = None
     _model = None
-    
+    _tokenizer = None
+    _device = None
+    _initialized = False
+
     def __new__(cls):
         if cls._instance is None:
-            print("创建新的 Embedding 实例")
             cls._instance = super().__new__(cls)
-            
+        if not cls._initialized:
             try:
-                print("初始化 pipeline...")
-                cls._model = AutoModel.from_pretrained("jinaai/jina-embeddings-v2-base-code", trust_remote_code=True).to("cuda:0")
-                print("embedding model 初始化成功")
+                print("Initializing embedding model...")
+                cls._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+                model_name = "jinaai/jina-embeddings-v2-base-code"
+                cls._tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+                cls._model = AutoModel.from_pretrained(model_name, trust_remote_code=True).to(cls._device)
+                cls._model.eval()
+                cls._initialized = True
+                print(f"Embedding model initialized on {cls._device}")
             except Exception as e:
-                print(f"pipeline 初始化失败: {e}")
+                print(f"Embedding model initialization failed: {e}")
                 raise
         return cls._instance
-    
+
     def __init__(self):
-        pass
-    
+        return
+
     def get_embedding(self, text):
-        """获取文本的 embedding"""
         try:
             if text is None:
-                print("警告: 输入文本为 None")
+                print("Warning: embedding input is None")
                 return None
-                
             if not isinstance(text, str):
-                print(f"警告: 输入文本类型不是字符串，而是 {type(text)}")
+                print(f"Warning: embedding input is not str, got {type(text)}")
                 text = str(text)
-                
             if not text.strip():
-                print("警告: 输入文本为空")
+                print("Warning: embedding input is empty")
                 return None
-            
-            return self._model.encode([text])[0].tolist()
-            
+            if self._model is None or self._tokenizer is None:
+                raise RuntimeError("Embedding model is not initialized")
+
+            inputs = self._tokenizer(
+                text,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=512,
+            )
+            inputs = {key: value.to(self._device) for key, value in inputs.items()}
+            with torch.no_grad():
+                outputs = self._model(**inputs)
+                hidden = outputs.last_hidden_state
+                mask = inputs["attention_mask"].unsqueeze(-1).expand(hidden.size()).float()
+                summed = torch.sum(hidden * mask, dim=1)
+                counts = torch.clamp(mask.sum(dim=1), min=1e-9)
+                embedding = summed / counts
+                embedding = torch.nn.functional.normalize(embedding, p=2, dim=1)
+            return embedding[0].detach().cpu().tolist()
         except Exception as e:
-            print(f"获取 embedding 时出错: {e}")
-            print(f"model 状态: {self._model}")
+            print(f"Error while getting embedding: {e}")
+            print(f"model state: {self._model}")
             print(traceback.format_exc())
             return None
 
     def _cos_similarity(self, vec1, vec2):
-        """计算两个向量的余弦相似度"""
         return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
 
     def text_similarity(self, text1, text2):
-        """计算两个文本的相似度"""
         vec1 = self.get_embedding(text1)
         vec2 = self.get_embedding(text2)
         return self._cos_similarity(vec1, vec2)

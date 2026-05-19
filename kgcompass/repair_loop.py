@@ -176,6 +176,7 @@ class FailureAnalysis:
     timing_sensitive: bool = False
     timing_hints: List[str] = field(default_factory=list)
     failure_line_number: int = 0
+    failure_file_path: str = ""
     observed_signal: str = ""
     expected_idle: str = ""
     candidate_patch_excerpt: str = ""
@@ -355,6 +356,7 @@ class FailureAnalyzer:
         failure_kind = _step_kind(next((s for s in (getattr(validation_result, "steps", None) or []) if not _step_passed(s)), None)) if validation_result else ""
         failure_expected = ""
         failure_actual = ""
+        failure_file_path = ""
         if validation_result is not None and getattr(validation_result, "steps", None):
             for step in getattr(validation_result, "steps", []):
                 if _step_passed(step):
@@ -363,6 +365,7 @@ class FailureAnalyzer:
                 failure_actual = _step_actual(step)
                 failure_kind = _step_kind(step)
                 failure_step = _step_name(step)
+                failure_file_path = str(getattr(step, "failure_file_path", "") or "")
                 break
 
         timing_hint = self._timing_signature_for_validation(validation_result) if validation_result is not None else {
@@ -445,6 +448,7 @@ class FailureAnalyzer:
             timing_sensitive=bool(timing_hint.get("timing_sensitive")),
             timing_hints=list(timing_hint.get("timing_hints") or []),
             failure_line_number=_extract_failure_line_number(_extract_first_step_excerpt(validation_result) if validation_result is not None else ""),
+            failure_file_path=failure_file_path,
             observed_signal=str(timing_hint.get("observed_signal") or ""),
             expected_idle=str(timing_hint.get("expected_idle") or ""),
             candidate_patch_excerpt=candidate_patch_excerpt,
@@ -592,10 +596,9 @@ Example for {language_name}:
 
 Important:
 - Do not output a SEARCH block for Verilog/SystemVerilog.
-- Choose start_line/end_line from Candidate Source Files when available.
-- The tool will read the original code from the current worktree and replace that inclusive line range.
-- Keep line ranges small and aligned to complete RTL statements or blocks.
-- Do not invent new ports, signals, or instance connections unless they already exist in the file context or the fix explicitly requires adding them.
+- Choose start_line/end_line from the visible source context.
+- Keep the patch inside one RTL block whenever possible.
+- Keep ports, signal names, and instance wiring unchanged unless the bug clearly requires an interface change.
 - Do not edit the source repository; only edit the cloned worktree.
 - Output one REPLACE block per file region.
 {language_notes}
@@ -689,7 +692,7 @@ Important:
         sections.append(self._section("Localization Summary", self._limit(localization_summary, 2200)))
         sections.append(self._section("Current Edit Targets", self._limit(current_edit_targets, 5000)))
         if candidate_source_context:
-            sections.append(self._section("Candidate Source Files", self._limit(candidate_source_context, 18000)))
+            sections.append(self._section("Candidate Source Files (full-file preferred for high-confidence candidates)", self._limit(candidate_source_context, 18000)))
         sections.append(self._section("Evidence Entities", self._limit(evidence_entities, 3500)))
 
         failure_lines = []
@@ -728,6 +731,8 @@ Important:
                 failure_lines.append(f"expected_idle: {analysis.expected_idle}")
             if analysis.failure_line_number:
                 failure_lines.append(f"failure_line_number: {analysis.failure_line_number}")
+            if analysis.failure_file_path:
+                failure_lines.append(f"failure_file_path: {analysis.failure_file_path}")
             if analysis.stimulus_window:
                 failure_lines.append("stimulus_window:")
                 failure_lines.append(self._limit(analysis.stimulus_window, 1800))
@@ -851,9 +856,6 @@ Important:
         self,
         *,
         problem_statement: str,
-        localization_summary: str,
-        current_edit_targets: str,
-        evidence_entities: str,
         candidate_source_context: str,
         hard_constraints: Sequence[str],
         language_prompt_parts: Dict[str, str],
@@ -865,48 +867,37 @@ Important:
         sections = [
             self._section(
                 "Agent Role",
-                "Generation Agent. Produce the first RTL repair patch. In this phase the priority is a minimal patch that applies cleanly to the current worktree.",
+                "Generation Agent. Produce the first RTL repair patch with the smallest possible edit surface.",
             )
         ]
-        if self.global_rtl_rules:
-            sections.append(self._section("Global RTL Repair Rules", self._limit(self.global_rtl_rules, 7000)))
         sections.extend(
             [
                 self._section("Attempt", f"- phase: generation\n- attempt: {attempt_index}/{max_attempts}"),
-                self._section("Issue Summary", self._limit(problem_statement, 2200)),
-                self._section("KG Localization Summary", self._limit(localization_summary, 2200)),
-                self._section("Editable Targets From KG", self._limit(current_edit_targets, 4200)),
+                self._section("Issue Summary", self._limit(problem_statement, 1800)),
             ]
         )
         if candidate_source_context:
-            sections.append(self._section("Candidate RTL Source Files", self._limit(candidate_source_context, 18000)))
-        sections.append(self._section("Evidence Entities", self._limit(evidence_entities, 2500)))
+            sections.append(self._section("Candidate RTL Source Files", self._limit(candidate_source_context, 14000)))
 
         feedback = []
-        if baseline_note:
-            feedback.append(f"baseline_note: {baseline_note}")
-        if analysis is None:
-            feedback.append("signature: initial_generation")
-        else:
+        if analysis is not None:
             feedback.append(f"signature: {analysis.signature}")
-            feedback.append(f"summary: {analysis.summary}")
-            feedback.append("The previous generation patch did not apply. Do not repeat it; choose visible line ranges and smaller complete RTL regions.")
             if analysis.candidate_patch_excerpt:
-                feedback.append("failed_patch_excerpt:")
-                feedback.append(self._limit(analysis.candidate_patch_excerpt, 1200))
-        sections.append(self._section("Generation Feedback", "\n".join(feedback)))
+                feedback.append(self._limit(analysis.candidate_patch_excerpt, 900))
+            if analysis.recommendation:
+                feedback.append(self._limit(analysis.recommendation, 240))
+        if baseline_note:
+            feedback.append(self._limit(baseline_note, 240))
+        if feedback:
+            sections.append(self._section("Previous Attempt", "\n".join(feedback)))
 
-        constraints = list(hard_constraints)
-        constraints.extend(
-            [
-                "This is not the debug phase. Do not optimize against validation logs that are not shown.",
-                "Prefer one or two minimal RTL regions. Avoid whole-file, whole-module, or broad always-block rewrites.",
-                "Use only line ranges visible in Candidate RTL Source Files.",
-                "For Verilog/SystemVerilog, output line-range REPLACE blocks only; do not output SEARCH.",
-                "The patch must be cleanly applicable. If unsure, choose a smaller complete statement or block.",
-            ]
-        )
-        sections.append(self._bullet_section("Generation Constraints", constraints))
+        constraints = [
+            "Edit only the files shown in Candidate RTL Source Files.",
+            "Use the visible source as the source of truth for file paths and line ranges.",
+            "Prefer the smallest complete RTL block that fixes the issue.",
+            "For Verilog/SystemVerilog, output line-range REPLACE blocks only; do not output SEARCH.",
+        ]
+        sections.append(self._bullet_section("Patch Rules", constraints))
         sections.append(self._format_language_block(language_prompt_parts))
         return self._fit_prompt(sections)
 
@@ -926,17 +917,13 @@ Important:
         sections = [
             self._section(
                 "Agent Role",
-                "Debug Agent. A patch has already reached validation. Ignore KG localization and repair using validation failure evidence plus the current target source.",
+                "Debug Agent. Repair using validation failure evidence and the current target source only.",
             )
         ]
-        if self.global_rtl_rules:
-            sections.append(self._section("Global RTL Repair Rules", self._limit(self.global_rtl_rules, 7000)))
-        sections.extend(
-            [
-                self._section("Attempt", f"- phase: debug\n- attempt: {attempt_index}/{max_attempts}\n- mode: {analysis.prompt_mode}"),
-                self._section("Issue Summary", self._limit(problem_statement, 1600)),
-            ]
-        )
+        sections.extend([
+            self._section("Attempt", f"- phase: debug\n- attempt: {attempt_index}/{max_attempts}\n- mode: {analysis.prompt_mode}"),
+            self._section("Issue Summary", self._limit(problem_statement, 1000)),
+        ])
 
         failure = []
         if baseline_note:
@@ -959,6 +946,8 @@ Important:
             failure.append(f"observed_signal: {analysis.observed_signal}")
         if analysis.expected_idle:
             failure.append(f"expected_idle: {analysis.expected_idle}")
+        if analysis.failure_file_path:
+            failure.append(f"failure_file_path: {analysis.failure_file_path}")
         if analysis.stimulus_window:
             failure.append("stimulus_window:")
             failure.append(self._limit(analysis.stimulus_window, 1800))
@@ -970,30 +959,19 @@ Important:
             failure.extend(f"- {entry}" for entry in analysis.evidence[:8])
         sections.append(self._section("Validation Failure Evidence", "\n".join(failure)))
 
-        chain_checklist = self._rtl_signal_chain_checklist(analysis)
-        if chain_checklist:
-            sections.append(self._section("RTL Signal Propagation Checklist", chain_checklist))
-
         if candidate_source_context:
-            sections.append(self._section("Current Target Source Files", self._limit(candidate_source_context, 20000)))
+            sections.append(self._section("Current Target Source Files", self._limit(candidate_source_context, 14000)))
 
-        prior_lines = [self._format_attempt(attempt) for attempt in prior_attempts[-5:]] if prior_attempts else ["- none"]
-        sections.append(self._section("Prior Attempts", "\n\n".join(prior_lines)))
 
-        constraints = list(hard_constraints)
-        constraints.extend(
-            [
-                "Do not use KG localization in this phase; trust validation failure evidence and current target source.",
-                "If compile failed, fix only the syntax/interface/width issue shown by the compiler.",
-                "If targeted failed, repair the direct driver of the observed failing signal.",
-                "Do not change testbench files or test expectations.",
-                "Do not rewrite unrelated RTL behavior that passed regression.",
-                "For Verilog/SystemVerilog, output line-range REPLACE blocks only; do not output SEARCH.",
-            ]
-        )
+        constraints = [
+            "Use the failure evidence and current target source only.",
+            "If compile failed, fix the syntax or interface issue shown by the compiler.",
+            "If targeted failed, repair the direct driver of the observed failing signal.",
+            "For Verilog/SystemVerilog, output line-range REPLACE blocks only; do not output SEARCH.",
+        ]
         if analysis.timing_sensitive:
-            constraints.append("Timing-sensitive failure: make the observed output correct at the exact failing stimulus window, not only later in the transaction.")
-        sections.append(self._bullet_section("Debug Constraints", constraints))
+            constraints.append("Make the observed output correct at the exact failing stimulus window.")
+        sections.append(self._bullet_section("Debug Rules", constraints))
         sections.append(self._format_language_block(language_prompt_parts))
         return self._fit_prompt(sections)
 
@@ -1002,7 +980,6 @@ Important:
         *,
         problem_statement: str,
         candidate_source_context: str,
-        debug_kg_context: str = "",
         analysis: FailureAnalysis,
         prior_attempts: Sequence[Dict[str, Any]] = (),
         baseline_note: str = "",
@@ -1014,9 +991,7 @@ Important:
                 "Debug Diagnose Agent. Diagnose the validation failure and request the RTL files needed for the next patch. Do not output a patch.",
             )
         ]
-        if self.global_rtl_rules:
-            sections.append(self._section("Global RTL Repair Rules", self._limit(self.global_rtl_rules, 4500)))
-        sections.append(self._section("Issue Summary", self._limit(problem_statement, 1600)))
+        sections.append(self._section("Issue Summary", self._limit(problem_statement, 1400)))
 
         failure = []
         if baseline_note:
@@ -1033,6 +1008,8 @@ Important:
             failure.append(f"observed_signal: {analysis.observed_signal}")
         if analysis.expected_idle:
             failure.append(f"expected_idle: {analysis.expected_idle}")
+        if analysis.failure_file_path:
+            failure.append(f"failure_file_path: {analysis.failure_file_path}")
         if analysis.timing_signature:
             failure.append(f"timing_signature: {analysis.timing_signature}")
         if analysis.stimulus_window:
@@ -1043,18 +1020,8 @@ Important:
             failure.append(self._limit(analysis.targeted_excerpt, 1800))
         sections.append(self._section("Validation Failure Evidence", "\n".join(failure)))
 
-        chain_checklist = self._rtl_signal_chain_checklist(analysis)
-        if chain_checklist:
-            sections.append(self._section("RTL Signal Propagation Checklist", chain_checklist))
-
-        if debug_kg_context:
-            sections.append(self._section("Debug KG Context", self._limit(debug_kg_context, 5000)))
-
         if candidate_source_context:
-            sections.append(self._section("Currently Visible Source Context", self._limit(candidate_source_context, 14000)))
-
-        prior_lines = [self._format_attempt(attempt) for attempt in prior_attempts[-4:]] if prior_attempts else ["- none"]
-        sections.append(self._section("Prior Attempts", "\n\n".join(prior_lines)))
+            sections.append(self._section("Currently Visible Source Context (diagnosis-requested files expanded fully when possible)", self._limit(candidate_source_context, 14000)))
 
         schema = f"""
 Return only JSON. Do not wrap it in Markdown fences.
@@ -1082,10 +1049,9 @@ The JSON object must use this schema:
 }}
 Rules:
 - Request at most {max_files} RTL/include files.
-- Prefer files already visible in the source context, then upstream/downstream files needed to close the signal chain.
-- Do not request testbench files unless the failure evidence is unclear; tests are oracle by default.
-- For targeted_failed, include the file containing the direct driver of the observed signal when identifiable.
-- For cross-module propagation, include the top-level wiring file and the config/register decode file if relevant.
+- Prefer files already visible in the source context.
+- Do not request testbench files.
+- Include only the files needed to close the signal chain.
 """
         sections.append(self._section("Diagnosis Output Contract", schema.strip()))
         return self._fit_prompt(sections)
@@ -1096,7 +1062,6 @@ Rules:
         problem_statement: str,
         expanded_source_context: str,
         diagnosis: Dict[str, Any],
-        debug_kg_context: str = "",
         hard_constraints: Sequence[str],
         language_prompt_parts: Dict[str, str],
         attempt_index: int,
@@ -1111,50 +1076,37 @@ Rules:
                 "Debug Patch Agent. Use the diagnosis, validation evidence, and current worktree source to produce the smallest line-range REPLACE patch.",
             )
         ]
-        if self.global_rtl_rules:
-            sections.append(self._section("Global RTL Repair Rules", self._limit(self.global_rtl_rules, 5500)))
         sections.append(self._section("Attempt", f"- phase: debug_patch\n- attempt: {attempt_index}/{max_attempts}\n- mode: {analysis.prompt_mode}"))
-        sections.append(self._section("Issue Summary", self._limit(problem_statement, 1400)))
         sections.append(self._section("Diagnosis JSON", json.dumps(diagnosis or {}, indent=2, ensure_ascii=False)))
 
         failure = []
         if baseline_note:
             failure.append(f"baseline_note: {baseline_note}")
         failure.append(f"signature: {analysis.signature}")
-        if analysis.summary:
-            failure.append("summary:")
-            failure.append(self._limit(analysis.summary, 1800))
         if analysis.observed_signal:
             failure.append(f"observed_signal: {analysis.observed_signal}")
         if analysis.expected_idle:
             failure.append(f"expected_idle: {analysis.expected_idle}")
+        if analysis.failure_file_path:
+            failure.append(f"failure_file_path: {analysis.failure_file_path}")
         if analysis.stimulus_window:
             failure.append("stimulus_window:")
             failure.append(self._limit(analysis.stimulus_window, 1200))
         sections.append(self._section("Validation Failure Evidence", "\n".join(failure)))
 
-        if debug_kg_context:
-            sections.append(self._section("Debug KG Context", self._limit(debug_kg_context, 5000)))
-
         if expanded_source_context:
             sections.append(self._section("Expanded Current Worktree Source", self._limit(expanded_source_context, 24000)))
 
-        prior_lines = [self._format_attempt(attempt) for attempt in prior_attempts[-4:]] if prior_attempts else ["- none"]
-        sections.append(self._section("Prior Attempts", "\n\n".join(prior_lines)))
 
-        constraints = list(hard_constraints)
-        constraints.extend(
-            [
-                "Patch only files shown in Expanded Current Worktree Source.",
-                "Use Debug KG Context as a compact structure index for cross-file signal propagation; validation evidence remains the source of truth.",
-                "Use the diagnosis to close the broken signal chain; do not re-localize broadly.",
-                "For targeted_failed, repair the direct driver of observed_signal first. If the direct driver depends on missing upstream wiring, patch that wiring too.",
-                "Do not modify testbench files or test expectations.",
-                "Output only line-range REPLACE blocks. No JSON, no explanation, no Markdown fences.",
-            ]
-        )
+        constraints = [
+            "Patch only files shown in Expanded Current Worktree Source.",
+            "Use the diagnosis to close the broken signal chain.",
+            "For targeted_failed, repair the direct driver first.",
+            "Do not modify testbench files or test expectations.",
+            "Output only line-range REPLACE blocks. No JSON, no explanation, no Markdown fences.",
+        ]
         if analysis.timing_sensitive:
-            constraints.append("Make the observed output correct at the exact failing stimulus window, not only later.")
+            constraints.append("Make the observed output correct at the exact failing stimulus window.")
         sections.append(self._bullet_section("Debug Patch Constraints", constraints))
         sections.append(self._format_language_block(language_prompt_parts))
         return self._fit_prompt(sections)

@@ -19,7 +19,8 @@ from utils import (
     get_python_files_from_content,
     get_ref_ids, 
     get_reference_functions_from_text, 
-    read_file, 
+    read_file,
+    normalize_repo_path,
     TextAnalyzer
 )
 from links import PatchLinkExpander
@@ -75,41 +76,7 @@ class CodeAnalyzer:
         self.counted_skipped_artifact_ids = set()
 
     def _clean_path(self, file_path: str) -> str:
-        """Return a normalized absolute path with forward slashes.
-        此函数曾经去掉 'playground/' 前缀，导致同一文件在 KG 中出现两种 path 表示
-        （绝对路径 vs. 相对路径），从而使 Issue-File 与 File-Method 无法连通。
-
-        为保持一致性，改为简单地规范化路径分隔符，并返回绝对路径。
-        """
-        # 统一为 Linux 风格分隔符
-        path = os.path.normpath(file_path).replace('\\', '/')
-        if os.path.isabs(path):
-            try:
-                path = os.path.relpath(path, os.getcwd()).replace('\\', '/')
-            except ValueError:
-                pass
-
-        if path.startswith('workdirs/'):
-            parts = path.split('/')
-            if len(parts) > 4 and parts[2] == 'repos':
-                return '/'.join(parts[4:])
-
-        for root_marker in ('playground', 'verilog_repair_cases'):
-            prefix = root_marker + '/'
-            if path.startswith(prefix):
-                parts = path.split('/')
-                if len(parts) > 2:
-                    return '/'.join(parts[2:])
-
-        path_after_playground = path
-
-        # 去掉仓库顶层目录（如 astropy__astropy）
-        repo_dir = os.path.basename(os.path.normpath(self.config['repo_path'].rstrip('/')))
-        parts = path_after_playground.split('/')
-        if parts and parts[0] == repo_dir:
-            path_after_playground = '/'.join(parts[1:]) if len(parts) > 1 else ''
-
-        return path_after_playground
+        return normalize_repo_path(file_path, self.config.get('repo_path', ''))
 
     def _check_and_count_artifact_time(self, artifact_timestamp, artifact_unique_id: str) -> bool:
         """
@@ -142,9 +109,17 @@ class CodeAnalyzer:
             if not target_sample:
                 return
             self._process_repository(target_sample)
+            issue_text = target_sample.get('problem_statement', '') or target_sample.get('issue', '') or ''
+            issue_mentioned_files = self._extract_verilog_issue_file_hints(issue_text) if self.language_config.language == 'verilog' else []
             
             # Get related entities
-            related_entities = self.kg.get_all_similarities_to_root(limit=SEARCH_SPACE, max_hops=4, sort=True)
+            related_entities = self.kg.get_all_similarities_to_root(
+                limit=SEARCH_SPACE,
+                max_hops=4,
+                sort=True,
+                issue_text=issue_text,
+                issue_mentioned_files=issue_mentioned_files,
+            )
 
             if 'methods' in related_entities:
                 related_entities['methods'].sort(key=lambda x: x.get('similarity', 0), reverse=True)
@@ -158,7 +133,8 @@ class CodeAnalyzer:
             return {
                 'related_entities': related_entities,
                 'artifact_stats': self.artifact_stats,
-                'issue': target_sample.get('problem_statement', ''),
+                'issue': issue_text,
+                'issue_mentioned_files': issue_mentioned_files,
                 'language': self.language_config.language,
                 'instance_id': self.config.get('instance_id'),
                 'repo': self.config.get('repo_name'),
@@ -169,6 +145,22 @@ class CodeAnalyzer:
             print(traceback.format_exc())
         finally:
             self._cleanup()
+
+    def _extract_verilog_issue_file_hints(self, issue_text: str):
+        issue_text = issue_text or ''
+        hints = []
+        seen = set()
+        for match in re.finditer(r"`([^`]+\.(?:sv|svh|v|vh))`", issue_text, flags=re.IGNORECASE):
+            value = match.group(1).strip().replace('\\', '/')
+            if value and value not in seen:
+                hints.append(value)
+                seen.add(value)
+        for match in re.finditer(r"(?<![\w./-])([A-Za-z0-9_./-]+\.(?:sv|svh|v|vh))\b", issue_text, flags=re.IGNORECASE):
+            value = match.group(1).strip().replace('\\', '/')
+            if value and value not in seen:
+                hints.append(value)
+                seen.add(value)
+        return hints
 
     # Use GitPython to get file commit information
     def get_commit_info(self, file_path):
@@ -523,6 +515,14 @@ class CodeAnalyzer:
             print(f"Error extracting Verilog RTL graph for {file_path}: {e}")
             return
 
+        def _edge_weight(parse_confidence, default_weight=NORMAL_CONNECTION):
+            try:
+                confidence = float(parse_confidence)
+            except (TypeError, ValueError):
+                return default_weight
+            confidence = max(0.0, min(1.0, confidence))
+            return max(0.15, round(1.05 - confidence, 2))
+
         for entity in rtl_graph.get('entities', []):
             self.kg.create_hdl_entity(
                 entity['label'],
@@ -578,7 +578,7 @@ class CodeAnalyzer:
                 relation_kind=edge.get('relation_kind', 'uses'),
                 parse_source=edge.get('parse_source'),
                 parse_confidence=edge.get('parse_confidence'),
-                weight=NORMAL_CONNECTION,
+                weight=_edge_weight(edge.get('parse_confidence')),
             )
 
         for edge in rtl_graph.get('signal_edges', []):
@@ -596,7 +596,7 @@ class CodeAnalyzer:
                 relation_kind=edge.get('relation_kind', 'feeds'),
                 parse_source=edge.get('parse_source'),
                 parse_confidence=edge.get('parse_confidence'),
-                weight=NORMAL_CONNECTION,
+                weight=_edge_weight(edge.get('parse_confidence')),
             )
 
         for edge in rtl_graph.get('instance_edges', []):
@@ -610,7 +610,7 @@ class CodeAnalyzer:
                 relation_kind=edge.get('relation_kind', 'instantiates'),
                 parse_source=edge.get('parse_source'),
                 parse_confidence=edge.get('parse_confidence'),
-                weight=NORMAL_CONNECTION,
+                weight=_edge_weight(edge.get('parse_confidence')),
             )
 
     def _link_modified_methods_to_pr(self, issue_id):

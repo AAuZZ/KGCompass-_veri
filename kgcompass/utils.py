@@ -34,9 +34,51 @@ def _compact_text(text: str, limit: int = 1200) -> str:
         return text
     return text[:limit].rstrip() + "\n...[truncated]..."
 
+def normalize_repo_path(file_path: str, repo_root: str = "") -> str:
+    """Normalize a repo path to a stable repository-relative form."""
+    path = os.path.normpath(str(file_path or "")).replace('\\', '/')
+    if not path:
+        return ""
+
+    if repo_root:
+        try:
+            repo_root_abs = os.path.abspath(repo_root).replace('\\', '/')
+            path_abs = os.path.abspath(path).replace('\\', '/')
+            if path_abs.startswith(repo_root_abs.rstrip('/') + '/'):
+                path = os.path.relpath(path_abs, repo_root_abs).replace('\\', '/')
+        except ValueError:
+            pass
+    elif os.path.isabs(path):
+        try:
+            path = os.path.relpath(path, os.getcwd()).replace('\\', '/')
+        except ValueError:
+            pass
+
+    if path.startswith('workdirs/'):
+        parts = path.split('/')
+        if len(parts) > 4 and parts[2] == 'repos':
+            return '/'.join(parts[4:])
+
+    for marker in ('playground', 'verilog_repair_cases'):
+        prefix = marker + '/'
+        if path.startswith(prefix):
+            parts = path.split('/')
+            if len(parts) > 2:
+                return '/'.join(parts[2:])
+            return ''
+        marker_idx = path.find('/' + prefix)
+        if marker_idx >= 0:
+            parts = path[marker_idx + 1:].split('/')
+            if len(parts) > 2:
+                return '/'.join(parts[2:])
+            return ''
+
+    return path
+
+
 def _clean_path(file_path: str) -> str:
-    """Removes 'playground/' prefix and the project directory from a path."""
-    rel_path = os.path.normpath(os.path.relpath(file_path)).replace('\\', '/')
+    """Backward-compatible wrapper for repository-relative path normalization."""
+    rel_path = normalize_repo_path(file_path)
     if rel_path.startswith('workdirs/'):
         parts = rel_path.split('/')
         if len(parts) > 4 and parts[2] == 'repos':
@@ -69,6 +111,8 @@ VERILOG_EVIDENCE_LABELS = {
     'parameter',
     'macro',
     'state',
+    'branch',
+    'condition',
     'generateblock',
     'conditionalcompilationscope',
     'testbench',
@@ -154,6 +198,8 @@ def context_entity_priority(item, fallback_group=None):
             'signal': 1.18,
             'port': 1.16,
             'state': 1.14,
+            'branch': 1.08,
+            'condition': 1.08,
             'parameter': 1.10,
             'macro': 1.04,
             'generateblock': 0.96,
@@ -1039,30 +1085,7 @@ def applable_patch(patch_content, repo_name, commit_id):
         return False
 
 def relative_path(path):
-    norm = os.path.normpath(str(path)).replace('\\', '/')
-    if os.path.isabs(norm):
-        try:
-            norm = os.path.relpath(norm, os.getcwd()).replace('\\', '/')
-        except ValueError:
-            pass
-    if norm.startswith('workdirs/'):
-        parts = norm.split('/')
-        if len(parts) > 4 and parts[2] == 'repos':
-            return '/'.join(parts[4:])
-    for marker in ('playground', 'verilog_repair_cases'):
-        prefix = marker + '/'
-        if norm.startswith(prefix):
-            parts = norm.split('/')
-            if len(parts) > 2:
-                return '/'.join(parts[2:])
-            return ''
-        marker_idx = norm.find('/' + prefix)
-        if marker_idx >= 0:
-            parts = norm[marker_idx + 1:].split('/')
-            if len(parts) > 2:
-                return '/'.join(parts[2:])
-            return ''
-    return norm
+    return normalize_repo_path(path)
 
 def fake_git_apply(repo_playground, file_path, old_content, patch) -> str:
     repo_playground = os.path.join(repo_playground, str(uuid.uuid4()))
